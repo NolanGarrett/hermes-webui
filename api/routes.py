@@ -530,6 +530,75 @@ def _merge_active_profile_projects(legacy_rows, native_rows, active_profile):
     return merged
 
 
+_INVALID_PROJECT_ASSIGNMENT = "Invalid project assignment"
+
+
+def _validated_new_session_project_id(body):
+    """Return an authorized legacy project ID for a new session.
+
+    Authorization deliberately uses only ``load_projects()``. Native projects
+    are read-only in WebUI, so excluding the native adapter creates a legacy
+    allowlist and also preserves legacy precedence when a native row collides
+    with the same active-profile identity.
+    """
+    if "project_id" not in body or body["project_id"] is None:
+        return None
+
+    project_id = body["project_id"]
+    if (
+        not isinstance(project_id, str)
+        or not project_id
+        or project_id.strip() != project_id
+    ):
+        raise ValueError(_INVALID_PROJECT_ASSIGNMENT)
+
+    active_profile = _get_active_profile_name()
+    if (
+        not isinstance(active_profile, str)
+        or not active_profile
+        or active_profile.strip() != active_profile
+    ):
+        raise ValueError(_INVALID_PROJECT_ASSIGNMENT)
+
+    if "profile" in body:
+        requested_profile = body["profile"]
+        if (
+            not isinstance(requested_profile, str)
+            or not requested_profile
+            or requested_profile.strip() != requested_profile
+            or not _profiles_match(requested_profile, active_profile)
+        ):
+            raise ValueError(_INVALID_PROJECT_ASSIGNMENT)
+
+    try:
+        projects = load_projects()
+    except Exception as exc:
+        raise ValueError(_INVALID_PROJECT_ASSIGNMENT) from exc
+    if not isinstance(projects, list):
+        raise ValueError(_INVALID_PROJECT_ASSIGNMENT)
+
+    for row in projects:
+        if not isinstance(row, dict) or row.get("project_id") != project_id:
+            continue
+        row_profile = row.get("profile")
+        if (
+            not isinstance(row_profile, str)
+            or not row_profile
+            or row_profile.strip() != row_profile
+        ):
+            continue
+        if row.get("project_source") == "hermes-agent":
+            continue
+        if "read_only" in row and not isinstance(row["read_only"], bool):
+            continue
+        if row.get("read_only") is True:
+            continue
+        if _profiles_match(row_profile, active_profile):
+            return project_id
+
+    raise ValueError(_INVALID_PROJECT_ASSIGNMENT)
+
+
 def _query_flag(parsed_url, name: str) -> bool:
     """Return True for a truthy query flag value."""
     qs = parse_qs(parsed_url.query)
@@ -15493,6 +15562,10 @@ def handle_post(handler, parsed) -> bool:
         )
 
     if parsed.path == "/api/session/new":
+        try:
+            validated_project_id = _validated_new_session_project_id(body)
+        except ValueError:
+            return bad(handler, _INVALID_PROJECT_ASSIGNMENT, status=400)
         workspace_prev_session_id = body.get("prev_session_id")
         if workspace_prev_session_id and not _session_id_visible_to_request_profile(
             handler, workspace_prev_session_id, emit_error=False
@@ -15625,7 +15698,7 @@ def handle_post(handler, parsed) -> bool:
             model=model,
             model_provider=model_provider,
             profile=body.get("profile") or None,
-            project_id=body.get("project_id") or None,
+            project_id=validated_project_id,
             worktree_info=worktree_info,
             enabled_toolsets=enabled_toolsets,
         )
