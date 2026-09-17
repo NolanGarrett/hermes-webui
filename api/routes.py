@@ -62,6 +62,7 @@ from api.session_events import (
     unsubscribe_session_events,
 )
 from api.gateway_restart import restart_active_profile_gateway
+from api.projects_db_adapter import load_native_projects
 from api.shares import create_or_refresh_share, load_share, revoke_share
 
 logger = logging.getLogger(__name__)
@@ -496,6 +497,35 @@ def _all_profiles_query_flag(parsed_url) -> bool:
 def _all_profiles_enabled(parsed_url) -> bool:
     """Enable aggregate profile reads only when the request asks and mode allows it."""
     return _all_profiles_query_flag(parsed_url) and not _is_isolated_profile_mode()
+
+
+def _canonical_project_profile(profile):
+    profile = profile or "default"
+    return "default" if _is_root_profile(profile) else profile
+
+
+def _merge_active_profile_projects(legacy_rows, native_rows, active_profile):
+    """Append unrelated native rows without mutating either input."""
+    merged = list(legacy_rows)
+    identities = {
+        (_canonical_project_profile(row.get("profile")), row.get("project_id"))
+        for row in legacy_rows
+        if isinstance(row, dict) and row.get("project_id")
+    }
+    for row in native_rows:
+        if (
+            isinstance(row, dict)
+            and row.get("project_id")
+            and _profiles_match(row.get("profile"), active_profile)
+        ):
+            identity = (
+                _canonical_project_profile(row.get("profile")),
+                row["project_id"],
+            )
+            if identity not in identities:
+                merged.append(row)
+                identities.add(identity)
+    return merged
 
 
 def _query_flag(parsed_url, name: str) -> bool:
@@ -14269,6 +14299,15 @@ def handle_get(handler, parsed) -> bool:
             scoped = [p for p in all_projects
                       if _profiles_match(p.get("profile"), active_profile)]
             other_profile_count = 0 if isolated_profile_mode else len(all_projects) - len(scoped)
+            try:
+                native_projects = load_native_projects(active_profile)
+            except (ImportError, OSError, sqlite3.Error):
+                logger.debug("Native projects backend unavailable", exc_info=True)
+                native_projects = None
+            if isinstance(native_projects, list):
+                scoped = _merge_active_profile_projects(
+                    scoped, native_projects, active_profile
+                )
         return j(handler, {
             "projects": scoped,
             "all_profiles": all_profiles,
