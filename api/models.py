@@ -46,6 +46,7 @@ from api.agent_sessions import (
     read_session_lineage_metadata,
 )
 from api.process_event_utils import stamp_message_source
+from api.projects_db_adapter import native_project_ids_for_paths
 
 logger = logging.getLogger(__name__)
 CLI_VISIBLE_SESSION_LIMIT = 20
@@ -7800,12 +7801,31 @@ def _load_cli_sessions_uncached(
             _webhook_pid_cache[0] = ensure_webhook_project()
         return _webhook_pid_cache[0]
 
-    def _state_row_project_id(sid: str, source: str | None) -> str | None:
+    def _state_row_project_id(
+        sid: str,
+        source: str | None,
+        cwd: str | None,
+        native_project_ids: dict[str, str],
+    ) -> str | None:
         if is_cron_session(sid, source):
             return _cron_pid()
         if is_webhook_session(sid, source):
             return _webhook_pid()
-        return None
+        if normalize_agent_session_source(source).get('session_source') == 'kanban':
+            return None
+        if not isinstance(cwd, str) or not cwd.strip():
+            return None
+        return native_project_ids.get(cwd)
+
+    def _is_system_state_row(row: dict) -> bool:
+        sid = row['id']
+        source = row.get('source') or 'cli'
+        normalized_source = normalize_agent_session_source(source).get('session_source')
+        return (
+            is_cron_session(sid, source)
+            or is_webhook_session(sid, source)
+            or normalized_source == 'kanban'
+        )
 
     profile_value = _cli_profile or 'default'
     # A deleted WebUI session is tombstoned (see _record_webui_deleted_session_tombstone)
@@ -7818,7 +7838,7 @@ def _load_cli_sessions_uncached(
         _deleted_webui_tombstone = _load_webui_deleted_session_tombstone()
     except Exception:
         _deleted_webui_tombstone = frozenset()
-    for row in read_importable_agent_session_rows(
+    _state_rows = list(read_importable_agent_session_rows(
         db_path,
         limit=visible_session_limit if visible_session_limit is not None else (
             CRON_PROJECT_CHIP_LIMIT if source_filter == 'cron'
@@ -7832,7 +7852,29 @@ def _load_cli_sessions_uncached(
         # (especially kanban) from evicting every CLI/TUI/ACP conversation.
         exclude_sources=("cron", "webhook", "kanban") if source_filter is None else None,
         include_sources=None if source_filter is None else (source_filter,),
-    ):
+    ))
+    _native_project_ids: dict[str, str] = {}
+    _system_only_filter = (
+        source_filter is not None
+        and normalize_agent_session_source(source_filter).get('session_source')
+        in {'cron', 'webhook', 'kanban'}
+    )
+    if not _system_only_filter:
+        _native_project_paths = list(dict.fromkeys(
+            cwd
+            for row in _state_rows
+            if not _is_system_state_row(row)
+            and isinstance((cwd := row.get('cwd')), str)
+            and cwd.strip()
+        ))
+        try:
+            _native_project_ids = native_project_ids_for_paths(
+                _native_project_paths,
+                profile_name=profile_value,
+            ) or {}
+        except Exception:
+            logger.debug("Native project membership lookup failed")
+    for row in _state_rows:
         sid = row['id']
         raw_ts = row['last_activity'] or row['started_at']
         # Prefer the CLI session's own profile from the DB; fall back to
@@ -7874,7 +7916,12 @@ def _load_cli_sessions_uncached(
             'updated_at': raw_ts,
             'pinned': False,
             'archived': _archived,
-            'project_id': _state_row_project_id(sid, _source),
+            'project_id': _state_row_project_id(
+                sid,
+                _source,
+                row.get('cwd'),
+                _native_project_ids,
+            ),
             'profile': profile,
             'source_tag': _source,
             'raw_source': row.get('raw_source') or _source_meta.get('raw_source'),
@@ -8076,7 +8123,7 @@ def _load_cli_sessions_uncached(
                     'updated_at': raw_ts,
                     'pinned': False,
                     'archived': _archived,
-                    'project_id': _state_row_project_id(sid, _source),
+                    'project_id': _state_row_project_id(sid, _source, None, {}),
                     'profile': profile_value,
                     'source_tag': 'kanban',
                     'raw_source': row.get('raw_source') or _source_meta.get('raw_source'),
