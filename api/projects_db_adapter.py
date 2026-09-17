@@ -160,11 +160,17 @@ def load_native_projects(profile_name: str | None = None) -> list[dict] | None:
             else:
                 projects = projects_db.list_projects(conn)
             return [_project_dict(project, resolved_profile) for project in projects]
-    except (ImportError, sqlite3.Error, OSError):
-        logger.debug("Native projects backend unavailable", exc_info=True)
+    except (ImportError, sqlite3.Error, OSError) as exc:
+        logger.debug(
+            "Native projects backend unavailable (%s)",
+            type(exc).__name__,
+        )
         return None
-    except Exception:
-        logger.warning("Failed to load native projects", exc_info=True)
+    except Exception as exc:
+        logger.warning(
+            "Failed to load native projects (%s)",
+            type(exc).__name__,
+        )
         return None
 
 

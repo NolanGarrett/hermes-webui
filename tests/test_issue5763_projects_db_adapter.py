@@ -444,10 +444,11 @@ def test_missing_projects_db_module_logs_debug_and_fails_closed(
     home = tmp_path / "profiles" / "alpha"
     _create_db(home)
     real_import = adapter.importlib.import_module
+    sensitive_path = "/private/native/projects.db"
 
     def import_without_projects_db(name):
         if name == "hermes_cli.projects_db":
-            raise ModuleNotFoundError(name)
+            raise ModuleNotFoundError(sensitive_path)
         return real_import(name)
 
     monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
@@ -459,7 +460,11 @@ def test_missing_projects_db_module_logs_debug_and_fails_closed(
     records = [record for record in caplog.records if record.name == adapter.__name__]
     assert len(records) == 1
     assert records[0].levelno == logging.DEBUG
-    assert records[0].exc_info is not None
+    assert records[0].exc_info is None
+    assert records[0].getMessage() == (
+        "Native projects backend unavailable (ModuleNotFoundError)"
+    )
+    assert sensitive_path not in caplog.text
 
 
 def test_incompatible_projects_schema_fails_closed(tmp_path, monkeypatch):
@@ -487,19 +492,36 @@ def test_corrupt_projects_database_fails_closed(tmp_path, monkeypatch):
     assert load_native_projects(profile_name="alpha") is None
 
 
-def test_incompatible_native_project_dto_fails_closed(tmp_path, monkeypatch):
+def test_incompatible_native_project_dto_fails_closed_without_logging_paths(
+    tmp_path, monkeypatch, caplog
+):
     home = tmp_path / "profiles" / "alpha"
     _create_db(home)
     module = _fake_projects_db_module()
-    module.list_projects = lambda conn, include_archived=False: [
-        types.SimpleNamespace(id="p_broken", slug="broken")
-    ]
+    sensitive_path = "/private/native/project-alpha"
+
+    class BrokenProject:
+        @property
+        def id(self):
+            raise RuntimeError(sensitive_path)
+
+    module.list_projects = lambda conn, include_archived=False: [BrokenProject()]
 
     _install_projects_db(monkeypatch, module)
     monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
     monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
 
-    assert load_native_projects(profile_name="alpha") is None
+    with caplog.at_level(logging.WARNING, logger=adapter.__name__):
+        assert load_native_projects(profile_name="alpha") is None
+
+    records = [record for record in caplog.records if record.name == adapter.__name__]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is None
+    assert records[0].getMessage() == (
+        "Failed to load native projects (RuntimeError)"
+    )
+    assert sensitive_path not in caplog.text
 
 
 def test_committed_wal_rows_are_visible_while_writer_is_open(tmp_path, monkeypatch):
@@ -886,7 +908,11 @@ def test_busy_database_logs_debug_and_fails_closed(tmp_path, monkeypatch, caplog
         records = [record for record in caplog.records if record.name == adapter.__name__]
         assert len(records) == 1
         assert records[0].levelno == logging.DEBUG
-        assert records[0].exc_info is not None
+        assert records[0].exc_info is None
+        assert records[0].getMessage() == (
+            "Native projects backend unavailable (OperationalError)"
+        )
+        assert str(home) not in caplog.text
     finally:
         writer.rollback()
         writer.close()
@@ -935,8 +961,9 @@ def test_modern_list_projects_internal_type_error_is_logged_once(
     records = [record for record in caplog.records if record.name == adapter.__name__]
     assert len(records) == 1
     assert records[0].levelno == logging.WARNING
-    assert records[0].exc_info is not None
-    assert "internal backend failure" in caplog.text
+    assert records[0].exc_info is None
+    assert records[0].getMessage() == "Failed to load native projects (TypeError)"
+    assert "internal backend failure" not in caplog.text
 
 
 def test_modern_project_for_path_internal_type_error_is_not_retried(
