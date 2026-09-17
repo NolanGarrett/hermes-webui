@@ -207,6 +207,17 @@ def test_load_native_projects_maps_active_profile_project(tmp_path, monkeypatch)
     ]
 
 
+def test_load_native_projects_accepts_positional_profile_name(tmp_path, monkeypatch):
+    home = tmp_path / "profiles" / "alpha"
+    _create_db(home)
+
+    _install_projects_db(monkeypatch, _fake_projects_db_module())
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
+
+    assert load_native_projects("alpha") == []
+
+
 def test_native_project_ids_for_paths_uses_native_longest_folder_match(tmp_path, monkeypatch):
     home = tmp_path / "profiles" / "alpha"
     db_path = _create_db(home)
@@ -232,6 +243,19 @@ def test_native_project_ids_for_paths_uses_native_longest_folder_match(tmp_path,
     assert native_project_ids_for_paths(
         ["/work/app/src/main.py"], profile_name="alpha"
     ) == {"/work/app/src/main.py": "p_inner"}
+
+
+def test_native_project_ids_for_paths_accepts_positional_profile_name(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "profiles" / "alpha"
+    _create_db(home)
+
+    _install_projects_db(monkeypatch, _fake_projects_db_module())
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
+
+    assert native_project_ids_for_paths(["/work"], "alpha") == {}
 
 
 def test_invalid_traversal_profile_never_reaches_root_home_resolver(tmp_path, monkeypatch):
@@ -282,6 +306,27 @@ def test_isolated_mode_rejects_foreign_profile_before_resolving(tmp_path, monkey
 
     assert load_native_projects(profile_name="beta") is None
     assert resolver_calls == []
+
+
+def test_isolated_mode_accepts_existing_arbitrary_pinned_home(tmp_path, monkeypatch):
+    pinned_home = tmp_path / "pinned-hermes-home"
+    db_path = _create_db(pinned_home)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("p_alpha", "alpha", "Alpha", None, None, None, None, "/alpha", 1, 0),
+        )
+
+    _install_projects_db(monkeypatch, _fake_projects_db_module())
+    monkeypatch.setattr(profiles, "_is_isolated_profile_mode", lambda: True)
+    monkeypatch.setattr(profiles, "_isolated_profile_name", lambda: "alpha")
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: pinned_home)
+
+    rows = load_native_projects(profile_name="alpha")
+
+    assert rows is not None
+    assert [row["native_project_id"] for row in rows] == ["p_alpha"]
 
 
 def test_missing_database_creates_no_files_directories_or_sidecars(tmp_path, monkeypatch):
@@ -621,6 +666,77 @@ def test_path_batch_backend_failure_discards_partial_results(tmp_path, monkeypat
     assert native_project_ids_for_paths(
         ["/work/a", "/work/b"], profile_name="alpha"
     ) is None
+
+
+def test_modern_list_projects_internal_type_error_is_not_retried(tmp_path, monkeypatch):
+    home = tmp_path / "profiles" / "alpha"
+    _create_db(home)
+    module = _fake_projects_db_module()
+    calls = []
+
+    def failing_list(conn, *, include_archived=False):
+        calls.append(include_archived)
+        raise TypeError("internal backend failure")
+
+    module.list_projects = failing_list
+    _install_projects_db(monkeypatch, module)
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
+
+    assert load_native_projects(profile_name="alpha") is None
+    assert calls == [False]
+
+
+def test_modern_project_for_path_internal_type_error_is_not_retried(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "profiles" / "alpha"
+    _create_db(home)
+    module = _fake_projects_db_module()
+    calls = []
+
+    def failing_match(conn, path, *, include_archived=False):
+        calls.append((path, include_archived))
+        raise TypeError("internal backend failure")
+
+    module.project_for_path = failing_match
+    _install_projects_db(monkeypatch, module)
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
+
+    assert native_project_ids_for_paths(["/work"], profile_name="alpha") is None
+    assert calls == [("/work", False)]
+
+
+def test_positional_only_include_archived_signatures_are_supported(tmp_path, monkeypatch):
+    home = tmp_path / "profiles" / "alpha"
+    db_path = _create_db(home)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("p_old", "old", "Old", None, None, None, None, "/old", 1, 0),
+        )
+
+    module = types.ModuleType("hermes_cli.projects_db")
+
+    def positional_list(conn, include_archived=False, /):
+        row = conn.execute("SELECT * FROM projects").fetchone()
+        return [_project_from_row(conn, row)]
+
+    def positional_match(conn, path, include_archived=False, /):
+        return types.SimpleNamespace(id="p_old") if path == "/old/file" else None
+
+    module.list_projects = positional_list
+    module.project_for_path = positional_match
+    _install_projects_db(monkeypatch, module)
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
+
+    rows = load_native_projects(profile_name="alpha")
+    assert rows is not None and rows[0]["native_project_id"] == "p_old"
+    assert native_project_ids_for_paths(
+        ["/old/file"], profile_name="alpha"
+    ) == {"/old/file": "p_old"}
 
 
 def test_older_upstream_signatures_are_supported(tmp_path, monkeypatch):

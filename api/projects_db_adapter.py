@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import sqlite3
 from collections.abc import Iterable
 from contextlib import closing
@@ -26,7 +27,7 @@ def _requested_profile(profile_name: str | None) -> str | None:
 
 def _profile_home(profile_name: str) -> Path | None:
     home = Path(profiles.get_hermes_home_for_profile(profile_name)).expanduser()
-    if profiles._is_root_profile(profile_name):
+    if profiles._is_root_profile(profile_name) or profiles._is_isolated_profile_mode():
         return home if home.is_dir() else None
     if home.name != profile_name or home.parent.name != "profiles" or not home.is_dir():
         return None
@@ -46,6 +47,19 @@ def _open_read_only(db_path: Path) -> sqlite3.Connection:
         conn.close()
         raise
     return conn
+
+
+def _supports_include_archived(function: Any) -> bool:
+    parameters = inspect.signature(function).parameters
+    include_archived = parameters.get("include_archived")
+    supports_keyword = include_archived is not None and include_archived.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+    return supports_keyword or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def _folder_dict(folder: Any) -> dict:
@@ -85,7 +99,7 @@ def _project_dict(project: Any, profile_name: str) -> dict:
     }
 
 
-def load_native_projects(*, profile_name: str | None = None) -> list[dict] | None:
+def load_native_projects(profile_name: str | None = None) -> list[dict] | None:
     """Return active native projects without creating or migrating their store."""
     try:
         resolved_profile = _requested_profile(profile_name)
@@ -99,9 +113,9 @@ def load_native_projects(*, profile_name: str | None = None) -> list[dict] | Non
             return None
         projects_db = importlib.import_module("hermes_cli.projects_db")
         with closing(_open_read_only(db_path)) as conn:
-            try:
+            if _supports_include_archived(projects_db.list_projects):
                 projects = projects_db.list_projects(conn, include_archived=False)
-            except TypeError:
+            else:
                 projects = projects_db.list_projects(conn)
             return [_project_dict(project, resolved_profile) for project in projects]
     except Exception:
@@ -109,7 +123,7 @@ def load_native_projects(*, profile_name: str | None = None) -> list[dict] | Non
 
 
 def native_project_ids_for_paths(
-    paths: Iterable[str | None], *, profile_name: str | None = None
+    paths: Iterable[str | None], profile_name: str | None = None
 ) -> dict[str, str] | None:
     """Resolve paths to native project ids through the upstream matcher."""
     try:
@@ -127,14 +141,14 @@ def native_project_ids_for_paths(
             dict.fromkeys(path for path in paths if isinstance(path, str) and path.strip())
         )
         result: dict[str, str] = {}
+        project_for_path = projects_db.project_for_path
+        supports_include_archived = _supports_include_archived(project_for_path)
         with closing(_open_read_only(db_path)) as conn:
             for path in distinct_paths:
-                try:
-                    project = projects_db.project_for_path(
-                        conn, path, include_archived=False
-                    )
-                except TypeError:
-                    project = projects_db.project_for_path(conn, path)
+                if supports_include_archived:
+                    project = project_for_path(conn, path, include_archived=False)
+                else:
+                    project = project_for_path(conn, path)
                 if project is not None:
                     project_id = getattr(project, "id", None)
                     if not project_id:
