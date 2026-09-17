@@ -92,6 +92,7 @@ def test_mapping_batches_distinct_nonblank_cwds_and_preserves_row_order(monkeypa
     rows = [
         _agent_row("first", cwd="/work/one", started_at=30.0),
         _agent_row("second", cwd="/work/one", started_at=20.0),
+        _agent_row("unmatched", cwd="/work/unmatched", started_at=15.0),
         _agent_row("blank", cwd="", started_at=10.0),
         _agent_row("missing", cwd=None, started_at=5.0),
         _agent_row("third", cwd="/work/two", started_at=1.0),
@@ -99,10 +100,13 @@ def test_mapping_batches_distinct_nonblank_cwds_and_preserves_row_order(monkeypa
 
     result = _load_rows(monkeypatch, tmp_path, rows, profile="named-profile")
 
-    assert calls == [(["/work/one", "/work/two"], "named-profile")]
+    assert calls == [
+        (["/work/one", "/work/unmatched", "/work/two"], "named-profile")
+    ]
     assert [row["session_id"] for row in result] == [
         "first",
         "second",
+        "unmatched",
         "blank",
         "missing",
         "third",
@@ -110,6 +114,7 @@ def test_mapping_batches_distinct_nonblank_cwds_and_preserves_row_order(monkeypa
     assert [row["project_id"] for row in result] == [
         "one-project",
         "one-project",
+        None,
         None,
         None,
         "two-project",
