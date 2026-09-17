@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import sys
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any
 
 from api import profiles, projects_db_adapter as adapter
@@ -106,7 +108,8 @@ def _fake_projects_db_module() -> types.ModuleType:
         if not include_archived:
             sql += " WHERE archived = 0"
         sql += " ORDER BY created_at ASC"
-        return [_project_from_row(conn, row) for row in conn.execute(sql)]
+        rows = conn.execute(sql).fetchall()
+        return [_project_from_row(conn, row) for row in rows]
 
     def project_for_path(conn, path, *, include_archived=False):
         target = os.path.abspath(os.path.expanduser(str(path).strip()))
@@ -291,6 +294,54 @@ def test_missing_named_profile_cannot_read_root_database(tmp_path, monkeypatch):
     assert not (root_home / "profiles" / "missing").exists()
 
 
+def test_symlinked_database_leaf_cannot_escape_profile_home(tmp_path, monkeypatch):
+    alpha_home = tmp_path / "profiles" / "alpha"
+    beta_home = tmp_path / "profiles" / "beta"
+    alpha_home.mkdir(parents=True)
+    beta_db = _create_db(beta_home)
+    with sqlite3.connect(beta_db) as conn:
+        conn.execute(
+            "INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("p_beta", "beta", "Beta", None, None, None, None, "/beta", 1, 0),
+        )
+        conn.execute(
+            "INSERT INTO project_folders VALUES (?, ?, ?, ?, ?)",
+            ("p_beta", "/beta", None, 1, 1),
+        )
+    (alpha_home / "projects.db").symlink_to(beta_db)
+
+    _install_projects_db(monkeypatch, _fake_projects_db_module())
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: alpha_home)
+
+    assert load_native_projects(profile_name="alpha") is None
+    assert native_project_ids_for_paths(["/beta/private"], profile_name="alpha") is None
+
+
+def test_symlinked_profile_home_with_contained_database_is_accepted(
+    tmp_path, monkeypatch
+):
+    real_home = tmp_path / "real-alpha-home"
+    db_path = _create_db(real_home)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("p_alpha", "alpha", "Alpha", None, None, None, None, "/alpha", 1, 0),
+        )
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    linked_home = profiles_dir / "alpha"
+    linked_home.symlink_to(real_home, target_is_directory=True)
+
+    _install_projects_db(monkeypatch, _fake_projects_db_module())
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: linked_home)
+
+    rows = load_native_projects(profile_name="alpha")
+    assert rows is not None
+    assert [row["native_project_id"] for row in rows] == ["p_alpha"]
+
+
 def test_isolated_mode_rejects_foreign_profile_before_resolving(tmp_path, monkeypatch):
     pinned_home = tmp_path / "profiles" / "alpha"
     _create_db(pinned_home)
@@ -329,7 +380,9 @@ def test_isolated_mode_accepts_existing_arbitrary_pinned_home(tmp_path, monkeypa
     assert [row["native_project_id"] for row in rows] == ["p_alpha"]
 
 
-def test_missing_database_creates_no_files_directories_or_sidecars(tmp_path, monkeypatch):
+def test_missing_database_creates_no_files_directories_or_sidecars(
+    tmp_path, monkeypatch, caplog
+):
     home = tmp_path / "profiles" / "alpha"
     home.mkdir(parents=True)
     before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
@@ -337,7 +390,9 @@ def test_missing_database_creates_no_files_directories_or_sidecars(tmp_path, mon
     monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
     monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
 
-    assert load_native_projects(profile_name="alpha") is None
+    with caplog.at_level(logging.DEBUG, logger=adapter.__name__):
+        assert load_native_projects(profile_name="alpha") is None
+    assert [record for record in caplog.records if record.name == adapter.__name__] == []
     assert {path.relative_to(tmp_path) for path in tmp_path.rglob("*")} == before
     assert not (home / "projects.db").exists()
     assert not (home / "projects.db-wal").exists()
@@ -345,7 +400,9 @@ def test_missing_database_creates_no_files_directories_or_sidecars(tmp_path, mon
     assert not (home / "projects.db-journal").exists()
 
 
-def test_missing_projects_db_module_fails_closed(tmp_path, monkeypatch):
+def test_missing_projects_db_module_logs_debug_and_fails_closed(
+    tmp_path, monkeypatch, caplog
+):
     home = tmp_path / "profiles" / "alpha"
     _create_db(home)
     real_import = adapter.importlib.import_module
@@ -359,7 +416,12 @@ def test_missing_projects_db_module_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
     monkeypatch.setattr(adapter.importlib, "import_module", import_without_projects_db)
 
-    assert load_native_projects(profile_name="alpha") is None
+    with caplog.at_level(logging.DEBUG, logger=adapter.__name__):
+        assert load_native_projects(profile_name="alpha") is None
+    records = [record for record in caplog.records if record.name == adapter.__name__]
+    assert len(records) == 1
+    assert records[0].levelno == logging.DEBUG
+    assert records[0].exc_info is not None
 
 
 def test_incompatible_projects_schema_fails_closed(tmp_path, monkeypatch):
@@ -470,11 +532,102 @@ def test_uncommitted_delete_journal_write_is_never_exposed(tmp_path, monkeypatch
         monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
 
         rows = load_native_projects(profile_name="alpha")
-        if rows is not None:
-            assert [row["native_project_id"] for row in rows] == ["p_committed"]
+        assert rows is not None
+        assert [row["native_project_id"] for row in rows] == ["p_committed"]
     finally:
         writer.rollback()
         writer.close()
+
+
+def _assert_project_load_uses_one_snapshot(
+    tmp_path, monkeypatch, journal_mode: str
+):
+    home = tmp_path / "profiles" / "alpha"
+    db_path = _create_db(home)
+    with sqlite3.connect(db_path) as conn:
+        actual_mode = conn.execute(f"PRAGMA journal_mode={journal_mode}").fetchone()[0]
+        assert actual_mode.lower() == journal_mode.lower()
+        conn.execute(
+            "INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("p_snapshot", "snapshot", "Snapshot", None, None, None, None, "/old", 1, 0),
+        )
+        conn.execute(
+            "INSERT INTO project_folders VALUES (?, ?, ?, ?, ?)",
+            ("p_snapshot", "/old", None, 1, 1),
+        )
+
+    writer_started = Event()
+    writer_committed = Event()
+    writer_errors = []
+    writer_threads = []
+
+    def commit_path_change():
+        try:
+            with sqlite3.connect(db_path, timeout=2) as writer:
+                writer.execute(
+                    "UPDATE projects SET primary_path = ? WHERE id = ?",
+                    ("/new", "p_snapshot"),
+                )
+                writer.execute(
+                    "UPDATE project_folders SET path = ? WHERE project_id = ?",
+                    ("/new", "p_snapshot"),
+                )
+                writer_started.set()
+            writer_committed.set()
+        except Exception as exc:  # pragma: no cover - asserted below
+            writer_errors.append(exc)
+            writer_started.set()
+
+    module = _fake_projects_db_module()
+
+    def interleaved_list(conn, *, include_archived=False):
+        sql = "SELECT * FROM projects"
+        if not include_archived:
+            sql += " WHERE archived = 0"
+        rows = conn.execute(sql + " ORDER BY created_at ASC").fetchall()
+        writer_thread = Thread(target=commit_path_change)
+        writer_threads.append(writer_thread)
+        writer_thread.start()
+        assert writer_started.wait(1)
+        # WAL commits here. With DELETE plus a reader snapshot, commit waits for
+        # the adapter connection to close; either way the folder query follows
+        # the intervening write attempt deterministically.
+        writer_committed.wait(0.2)
+        return [_project_from_row(conn, row) for row in rows]
+
+    module.list_projects = interleaved_list
+    _install_projects_db(monkeypatch, module)
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
+
+    rows = load_native_projects(profile_name="alpha")
+    assert len(writer_threads) == 1
+    writer_threads[0].join(3)
+    assert not writer_threads[0].is_alive()
+    assert writer_committed.is_set()
+    assert writer_errors == []
+    assert rows is not None
+    assert [(row["primary_path"], row["folders"]) for row in rows] == [
+        (
+            "/old",
+            [
+                {
+                    "path": "/old",
+                    "label": None,
+                    "is_primary": True,
+                    "added_at": 1,
+                }
+            ],
+        )
+    ]
+
+
+def test_project_load_uses_one_wal_snapshot(tmp_path, monkeypatch):
+    _assert_project_load_uses_one_snapshot(tmp_path, monkeypatch, "WAL")
+
+
+def test_project_load_uses_one_delete_snapshot(tmp_path, monkeypatch):
+    _assert_project_load_uses_one_snapshot(tmp_path, monkeypatch, "DELETE")
 
 
 def test_clean_delete_database_read_creates_no_sidecars(tmp_path, monkeypatch):
@@ -494,6 +647,52 @@ def test_clean_delete_database_read_creates_no_sidecars(tmp_path, monkeypatch):
 
     assert load_native_projects(profile_name="alpha") is not None
     assert {path.name for path in home.iterdir()} == before == {"projects.db"}
+
+
+def test_path_batch_uses_one_snapshot_across_matches(tmp_path, monkeypatch):
+    home = tmp_path / "profiles" / "alpha"
+    db_path = _create_db(home)
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        conn.executemany(
+            "INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("p_old", "old", "Old", None, None, None, None, "/one", 1, 0),
+                ("p_new", "new", "New", None, None, None, None, "/two", 2, 0),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO project_folders VALUES (?, ?, ?, ?, ?)",
+            [
+                ("p_old", "/one", None, 1, 1),
+                ("p_old", "/two", None, 0, 2),
+            ],
+        )
+
+    module = _fake_projects_db_module()
+    real_match = module.project_for_path
+    calls = []
+
+    def interleaved_match(conn, path, *, include_archived=False):
+        project = real_match(conn, path, include_archived=include_archived)
+        calls.append(path)
+        if len(calls) == 1:
+            with sqlite3.connect(db_path) as writer:
+                writer.execute(
+                    "UPDATE project_folders SET project_id = ? WHERE path = ?",
+                    ("p_new", "/two"),
+                )
+        return project
+
+    module.project_for_path = interleaved_match
+    _install_projects_db(monkeypatch, module)
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
+
+    assert native_project_ids_for_paths(
+        ["/one/file", "/two/file"], profile_name="alpha"
+    ) == {"/one/file": "p_old", "/two/file": "p_old"}
+    assert calls == ["/one/file", "/two/file"]
 
 
 def test_path_batch_ignores_blanks_and_deduplicates_nonblank_paths(tmp_path, monkeypatch):
@@ -630,7 +829,7 @@ def test_adapter_closes_its_fresh_connection_after_read(tmp_path, monkeypatch):
         raise AssertionError("adapter leaked its SQLite connection")
 
 
-def test_busy_database_fails_closed(tmp_path, monkeypatch):
+def test_busy_database_logs_debug_and_fails_closed(tmp_path, monkeypatch, caplog):
     home = tmp_path / "profiles" / "alpha"
     db_path = _create_db(home)
     writer = sqlite3.connect(db_path)
@@ -642,7 +841,12 @@ def test_busy_database_fails_closed(tmp_path, monkeypatch):
         monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
         monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
 
-        assert load_native_projects(profile_name="alpha") is None
+        with caplog.at_level(logging.DEBUG, logger=adapter.__name__):
+            assert load_native_projects(profile_name="alpha") is None
+        records = [record for record in caplog.records if record.name == adapter.__name__]
+        assert len(records) == 1
+        assert records[0].levelno == logging.DEBUG
+        assert records[0].exc_info is not None
     finally:
         writer.rollback()
         writer.close()
@@ -668,7 +872,9 @@ def test_path_batch_backend_failure_discards_partial_results(tmp_path, monkeypat
     ) is None
 
 
-def test_modern_list_projects_internal_type_error_is_not_retried(tmp_path, monkeypatch):
+def test_modern_list_projects_internal_type_error_is_logged_once(
+    tmp_path, monkeypatch, caplog
+):
     home = tmp_path / "profiles" / "alpha"
     _create_db(home)
     module = _fake_projects_db_module()
@@ -683,8 +889,14 @@ def test_modern_list_projects_internal_type_error_is_not_retried(tmp_path, monke
     monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
     monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
 
-    assert load_native_projects(profile_name="alpha") is None
+    with caplog.at_level(logging.WARNING, logger=adapter.__name__):
+        assert load_native_projects(profile_name="alpha") is None
     assert calls == [False]
+    records = [record for record in caplog.records if record.name == adapter.__name__]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is not None
+    assert "internal backend failure" in caplog.text
 
 
 def test_modern_project_for_path_internal_type_error_is_not_retried(

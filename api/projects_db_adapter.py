@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import logging
 import sqlite3
 from collections.abc import Iterable
 from contextlib import closing
@@ -12,6 +13,8 @@ from typing import Any
 
 from api import profiles
 
+
+logger = logging.getLogger(__name__)
 
 _SQLITE_TIMEOUT_SECONDS = 1.0
 
@@ -34,6 +37,26 @@ def _profile_home(profile_name: str) -> Path | None:
     return home
 
 
+def _validated_db_path(home: Path) -> Path | None:
+    """Return an existing database path contained by its profile home.
+
+    The local boundary is crafted profile paths, not same-UID filesystem races:
+    reject a symlinked leaf and require its resolved target to remain in the
+    resolved profile home before opening it.
+    """
+    db_path = home / "projects.db"
+    if db_path.is_symlink():
+        return None
+    try:
+        resolved_home = home.resolve(strict=True)
+        resolved_db = db_path.resolve(strict=True)
+    except OSError:
+        return None
+    if not resolved_db.is_file() or not resolved_db.is_relative_to(resolved_home):
+        return None
+    return resolved_db
+
+
 def _open_read_only(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(
         f"{db_path.resolve().as_uri()}?mode=ro",
@@ -43,6 +66,7 @@ def _open_read_only(db_path: Path) -> sqlite3.Connection:
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
     except Exception:
         conn.close()
         raise
@@ -108,8 +132,8 @@ def load_native_projects(profile_name: str | None = None) -> list[dict] | None:
         home = _profile_home(resolved_profile)
         if home is None:
             return None
-        db_path = home / "projects.db"
-        if not db_path.is_file():
+        db_path = _validated_db_path(home)
+        if db_path is None:
             return None
         projects_db = importlib.import_module("hermes_cli.projects_db")
         with closing(_open_read_only(db_path)) as conn:
@@ -118,7 +142,11 @@ def load_native_projects(profile_name: str | None = None) -> list[dict] | None:
             else:
                 projects = projects_db.list_projects(conn)
             return [_project_dict(project, resolved_profile) for project in projects]
+    except (ImportError, sqlite3.Error, OSError):
+        logger.debug("Native projects backend unavailable", exc_info=True)
+        return None
     except Exception:
+        logger.warning("Failed to load native projects", exc_info=True)
         return None
 
 
@@ -133,8 +161,8 @@ def native_project_ids_for_paths(
         home = _profile_home(resolved_profile)
         if home is None:
             return None
-        db_path = home / "projects.db"
-        if not db_path.is_file():
+        db_path = _validated_db_path(home)
+        if db_path is None:
             return None
         projects_db = importlib.import_module("hermes_cli.projects_db")
         distinct_paths = list(
@@ -155,5 +183,9 @@ def native_project_ids_for_paths(
                         raise TypeError("native project is missing its id")
                     result[path] = project_id
         return result
+    except (ImportError, sqlite3.Error, OSError):
+        logger.debug("Native project path backend unavailable", exc_info=True)
+        return None
     except Exception:
+        logger.warning("Failed to resolve native project paths", exc_info=True)
         return None
