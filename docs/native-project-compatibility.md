@@ -8,10 +8,9 @@ through the existing project list and classifies ordinary imported Agent session
 from their persisted working directory (`cwd`). It does not migrate project data,
 create native projects, or add any native write path.
 
-The backend read-through described below is present in this source slice. The UI
-safety rules in [User-visible limitations in PR1](#user-visible-limitations-in-pr1)
-are the final PR1 release contract; their integration is developed separately and
-must land before PR1 is released.
+The backend read-through and the UI/API safety rules described below are present
+in this source slice. Native rows are visible and filterable, but they do not gain
+access to legacy project mutations or session-assignment paths.
 
 ## Authority and identity model
 
@@ -110,7 +109,7 @@ DB leaf. They are not a claim to eliminate every same-user filesystem race.
 
 ## User-visible limitations in PR1
 
-The final PR1 release must treat native projects as read-only compatibility rows:
+PR1 treats native projects as read-only compatibility rows:
 
 - They remain selectable as project filters.
 - They cannot be renamed, recolored, deleted, assigned to sessions, or used by
@@ -118,9 +117,12 @@ The final PR1 release must treat native projects as read-only compatibility rows
 - Selecting a native filter does not stamp that native project ID onto a newly
   created session. PR1 classification applies to imported Agent sessions through
   persisted `cwd` only.
-
-Those UI guards are an integration requirement for the final PR1 branch, not code
-claimed to be present in this backend-only source slice.
+- New-session assignment is checked in both the browser and
+  `POST /api/session/new`. The server accepts only a canonical project ID for a
+  known, writable legacy row in the active request profile. Native-only,
+  read-only, malformed, unknown, and foreign-profile IDs fail before workspace,
+  worktree, memory-lifecycle, or session-creation side effects. An absent or
+  explicit `null` project ID retains unassigned-session compatibility.
 
 ## Staged migration and follow-ups
 
@@ -185,8 +187,10 @@ WebUI, while legacy project groups and assignments continue unchanged.
 | Optional `state.db` cwd projection and continuation-tip cwd selection | `tests/test_issue5763_agent_session_cwd.py` |
 | Batched ordinary-session mapping, system-project precedence, malformed/failing matcher behavior, all-profile disablement, path-log privacy | `tests/test_issue5763_native_project_membership.py` |
 | Stat-only `projects.db`/non-empty-WAL cache fingerprint, SHM exclusion, no SQLite open/creation, no symlink following; unchanged `state.db` fingerprint regression coverage | `tests/test_cli_sessions_cache_fingerprint.py` |
+| Read-only native chips and mutation/assignment guards, exact project-list provenance, canonical IDs and profiles, explicit/implicit new-session behavior, and profile-switch races | `tests/test_issue5763_native_project_ui.py`, `tests/test_issue5763_final_authorization_boundaries.py` |
+| Server-side new-session project authorization, active-profile binding, legacy collision precedence, and pre-side-effect rejection | `tests/test_issue5763_server_project_authorization.py` |
 
-Run the focused backend matrix with:
+Run the focused compatibility matrix with:
 
 ```bash
 ./scripts/test.sh \
@@ -194,5 +198,8 @@ Run the focused backend matrix with:
   tests/test_issue5763_native_project_route.py \
   tests/test_issue5763_agent_session_cwd.py \
   tests/test_issue5763_native_project_membership.py \
+  tests/test_issue5763_native_project_ui.py \
+  tests/test_issue5763_final_authorization_boundaries.py \
+  tests/test_issue5763_server_project_authorization.py \
   tests/test_cli_sessions_cache_fingerprint.py
 ```
