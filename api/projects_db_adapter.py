@@ -201,9 +201,15 @@ def native_project_ids_for_paths(
                         raise TypeError("native project is missing its id")
                     result[path] = project_id
         return result
-    except (ImportError, sqlite3.Error, OSError):
-        logger.debug("Native project path backend unavailable", exc_info=True)
+    except (ImportError, sqlite3.Error, OSError) as exc:
+        logger.debug(
+            "Native project path backend unavailable (%s)",
+            type(exc).__name__,
+        )
         return None
-    except Exception:
-        logger.warning("Failed to resolve native project paths", exc_info=True)
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve native project paths (%s)",
+            type(exc).__name__,
+        )
         return None

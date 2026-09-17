@@ -15,6 +15,62 @@ import tempfile
 from pathlib import Path
 
 
+def _use_active_home(monkeypatch, tmp_path):
+    from api import models, profiles
+
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        models,
+        "_default_claude_code_projects_dir",
+        lambda: tmp_path / "claude-projects",
+    )
+    return models
+
+
+def test_single_profile_cache_key_tracks_projects_db_creation_and_change(
+    monkeypatch, tmp_path
+):
+    models = _use_active_home(monkeypatch, tmp_path)
+    projects_db = tmp_path / "projects.db"
+
+    assert not projects_db.exists()
+    key_missing = models._resolve_cli_sessions_context()[3]
+
+    projects_db.write_bytes(b"first")
+    key_created = models._resolve_cli_sessions_context()[3]
+
+    projects_db.write_bytes(b"second-longer")
+    key_changed = models._resolve_cli_sessions_context()[3]
+
+    assert key_missing != key_created
+    assert key_created != key_changed
+
+
+def test_projects_db_change_invalidates_fixed_streaming_cache_key(monkeypatch, tmp_path):
+    models = _use_active_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(models, "_active_stream_ids", lambda: {"fixed-stream"})
+    projects_db = tmp_path / "projects.db"
+    projects_db.write_bytes(b"first")
+
+    key_before = models._resolve_cli_sessions_context()[3]
+    projects_db.write_bytes(b"second-longer")
+    key_after = models._resolve_cli_sessions_context()[3]
+
+    assert key_before != key_after
+
+
+def test_missing_projects_db_cache_fingerprint_is_read_only(monkeypatch, tmp_path):
+    models = _use_active_home(monkeypatch, tmp_path)
+    projects_db = tmp_path / "projects.db"
+
+    models._resolve_cli_sessions_context()
+
+    assert not projects_db.exists()
+    assert not Path(f"{projects_db}-wal").exists()
+    assert not Path(f"{projects_db}-shm").exists()
+
+
 def test_content_fingerprint_advances_on_commit():
     """The cache key's content fingerprint must change after any commit, even
     when mtime/size would not reliably change (the WAL-collision flake source).

@@ -960,6 +960,66 @@ def test_modern_project_for_path_internal_type_error_is_not_retried(
     assert calls == [("/work", False)]
 
 
+def test_path_matcher_exception_does_not_log_sensitive_path(
+    tmp_path, monkeypatch, caplog
+):
+    sensitive_path = "/private/do-not-log"
+    home = tmp_path / "profiles" / "alpha"
+    _create_db(home)
+    module = _fake_projects_db_module()
+
+    def failing_match(conn, path, *, include_archived=False):
+        raise RuntimeError(f"matcher failed for {sensitive_path}")
+
+    module.project_for_path = failing_match
+    _install_projects_db(monkeypatch, module)
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
+
+    with caplog.at_level(logging.WARNING, logger=adapter.__name__):
+        assert native_project_ids_for_paths(
+            [sensitive_path], profile_name="alpha"
+        ) is None
+
+    records = [record for record in caplog.records if record.name == adapter.__name__]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is None
+    assert records[0].exc_text is None
+    assert "RuntimeError" in records[0].getMessage()
+    assert sensitive_path not in caplog.text
+
+
+def test_expected_path_matcher_error_logs_only_exception_class(
+    tmp_path, monkeypatch, caplog
+):
+    sensitive_path = "/private/do-not-log"
+    home = tmp_path / "profiles" / "alpha"
+    _create_db(home)
+    module = _fake_projects_db_module()
+
+    def failing_match(conn, path, *, include_archived=False):
+        raise sqlite3.DatabaseError(f"database failed for {sensitive_path}")
+
+    module.project_for_path = failing_match
+    _install_projects_db(monkeypatch, module)
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: home)
+
+    with caplog.at_level(logging.DEBUG, logger=adapter.__name__):
+        assert native_project_ids_for_paths(
+            [sensitive_path], profile_name="alpha"
+        ) is None
+
+    records = [record for record in caplog.records if record.name == adapter.__name__]
+    assert len(records) == 1
+    assert records[0].levelno == logging.DEBUG
+    assert records[0].exc_info is None
+    assert records[0].exc_text is None
+    assert "DatabaseError" in records[0].getMessage()
+    assert sensitive_path not in caplog.text
+
+
 def test_positional_only_include_archived_signatures_are_supported(tmp_path, monkeypatch):
     home = tmp_path / "profiles" / "alpha"
     db_path = _create_db(home)
