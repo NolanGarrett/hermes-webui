@@ -12,6 +12,8 @@ from pathlib import Path
 from threading import Event, Thread
 from typing import Any
 
+import pytest
+
 from api import profiles, projects_db_adapter as adapter
 from api.projects_db_adapter import load_native_projects, native_project_ids_for_paths
 
@@ -38,6 +40,11 @@ CREATE TABLE project_folders (
     PRIMARY KEY (project_id, path)
 );
 """
+
+
+@pytest.fixture(autouse=True)
+def _use_temporary_profiles_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", tmp_path)
 
 
 @dataclass
@@ -318,28 +325,59 @@ def test_symlinked_database_leaf_cannot_escape_profile_home(tmp_path, monkeypatc
     assert native_project_ids_for_paths(["/beta/private"], profile_name="alpha") is None
 
 
-def test_symlinked_profile_home_with_contained_database_is_accepted(
+def test_real_resolver_accepts_named_profile_symlink_within_profiles_root(
     tmp_path, monkeypatch
 ):
-    real_home = tmp_path / "real-alpha-home"
+    base = tmp_path / "hermes"
+    real_home = base / "profiles" / "store" / "beta"
     db_path = _create_db(real_home)
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("p_alpha", "alpha", "Alpha", None, None, None, None, "/alpha", 1, 0),
+            ("p_beta", "beta", "Beta", None, None, None, None, "/beta", 1, 0),
         )
-    profiles_dir = tmp_path / "profiles"
-    profiles_dir.mkdir()
-    linked_home = profiles_dir / "alpha"
-    linked_home.symlink_to(real_home, target_is_directory=True)
+        conn.execute(
+            "INSERT INTO project_folders VALUES (?, ?, ?, ?, ?)",
+            ("p_beta", "/beta", None, 1, 1),
+        )
+    (base / "profiles" / "beta").symlink_to(real_home, target_is_directory=True)
 
     _install_projects_db(monkeypatch, _fake_projects_db_module())
-    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
-    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda name: linked_home)
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
+    assert not profiles._is_isolated_profile_mode()
 
-    rows = load_native_projects(profile_name="alpha")
+    rows = load_native_projects(profile_name="beta")
     assert rows is not None
-    assert [row["native_project_id"] for row in rows] == ["p_alpha"]
+    assert [row["native_project_id"] for row in rows] == ["p_beta"]
+    assert native_project_ids_for_paths(
+        ["/beta/private"], profile_name="beta"
+    ) == {"/beta/private": "p_beta"}
+
+
+def test_real_resolver_rejects_named_profile_symlink_outside_profiles_root_quietly(
+    tmp_path, monkeypatch, caplog
+):
+    base = tmp_path / "hermes"
+    outside_home = tmp_path / "outside" / "beta"
+    _create_db(outside_home)
+    profiles_root = base / "profiles"
+    profiles_root.mkdir(parents=True)
+    (profiles_root / "beta").symlink_to(outside_home, target_is_directory=True)
+
+    _install_projects_db(monkeypatch, _fake_projects_db_module())
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
+    assert not profiles._is_isolated_profile_mode()
+
+    with caplog.at_level(logging.DEBUG, logger=adapter.__name__):
+        assert load_native_projects(profile_name="beta") is None
+        assert native_project_ids_for_paths(
+            ["/outside/private"], profile_name="beta"
+        ) is None
+
+    records = [record for record in caplog.records if record.name == adapter.__name__]
+    assert not [record for record in records if record.levelno >= logging.WARNING]
+    assert str(base) not in caplog.text
+    assert str(outside_home) not in caplog.text
 
 
 def test_isolated_mode_rejects_foreign_profile_before_resolving(tmp_path, monkeypatch):
@@ -794,6 +832,8 @@ def test_adapter_uses_normal_read_only_sqlite_and_never_upstream_connect(tmp_pat
     assert load_native_projects(profile_name="alpha") == []
     assert len(connection_calls) == 1
     args, kwargs = connection_calls[0]
+    # SQLite may create empty -wal/-shm auxiliaries for a clean WAL database
+    # even with mode=ro. Normal read-only mode is required for live WAL consistency.
     assert args[0].startswith("file:")
     assert args[0].endswith("?mode=ro")
     assert "immutable=1" not in args[0]

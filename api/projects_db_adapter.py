@@ -29,12 +29,30 @@ def _requested_profile(profile_name: str | None) -> str | None:
 
 
 def _profile_home(profile_name: str) -> Path | None:
-    home = Path(profiles.get_hermes_home_for_profile(profile_name)).expanduser()
-    if profiles._is_root_profile(profile_name) or profiles._is_isolated_profile_mode():
-        return home if home.is_dir() else None
-    if home.name != profile_name or home.parent.name != "profiles" or not home.is_dir():
+    try:
+        home = Path(profiles.get_hermes_home_for_profile(profile_name)).expanduser()
+    except (OSError, ValueError):
         return None
-    return home
+
+    if profiles._is_root_profile(profile_name) or profiles._is_isolated_profile_mode():
+        try:
+            return home if home.is_dir() else None
+        except (OSError, ValueError):
+            return None
+
+    try:
+        profiles_root = profiles._profiles_root()
+        lexical_home = profiles_root / profile_name
+        resolved_home = home.resolve(strict=True)
+        if (
+            lexical_home.resolve(strict=True) != resolved_home
+            or not resolved_home.is_relative_to(profiles_root)
+            or not resolved_home.is_dir()
+        ):
+            return None
+        return resolved_home
+    except (OSError, ValueError):
+        return None
 
 
 def _validated_db_path(home: Path) -> Path | None:
@@ -45,12 +63,12 @@ def _validated_db_path(home: Path) -> Path | None:
     resolved profile home before opening it.
     """
     db_path = home / "projects.db"
-    if db_path.is_symlink():
-        return None
     try:
+        if db_path.is_symlink():
+            return None
         resolved_home = home.resolve(strict=True)
         resolved_db = db_path.resolve(strict=True)
-    except OSError:
+    except (OSError, ValueError):
         return None
     if not resolved_db.is_file() or not resolved_db.is_relative_to(resolved_home):
         return None
