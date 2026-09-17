@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import stat as stat_module
 import threading
 import time
 import uuid
@@ -7520,23 +7521,35 @@ def _sqlite_file_stat_cache_key(db_path: Path):
 def _projects_db_stat_cache_key(db_path: Path):
     """Fingerprint durable main/WAL files without opening SQLite or reading SHM."""
 
-    def _durable_stat(path: Path):
+    def _durable_stat(path: Path, *, mark_non_regular: bool = False):
         try:
-            stat = path.stat()
+            path_stat = os.stat(path, follow_symlinks=False)
         except OSError:
             return None
+        if not stat_module.S_ISREG(path_stat.st_mode):
+            if not mark_non_regular:
+                return None
+            return (
+                "non-regular",
+                stat_module.S_IFMT(path_stat.st_mode),
+                path_stat.st_mtime_ns,
+                path_stat.st_ctime_ns,
+                path_stat.st_size,
+                path_stat.st_dev,
+                path_stat.st_ino,
+            )
         return (
-            stat.st_mtime_ns,
-            stat.st_ctime_ns,
-            stat.st_size,
-            stat.st_dev,
-            stat.st_ino,
+            path_stat.st_mtime_ns,
+            path_stat.st_ctime_ns,
+            path_stat.st_size,
+            path_stat.st_dev,
+            path_stat.st_ino,
         )
 
     wal_stat = _durable_stat(Path(f"{db_path}-wal"))
     if wal_stat is not None and wal_stat[2] <= 0:
         wal_stat = None
-    return (_durable_stat(db_path), wal_stat)
+    return (_durable_stat(db_path, mark_non_regular=True), wal_stat)
 
 
 def _cli_sessions_streaming_freeze_marker():

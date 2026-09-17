@@ -15,6 +15,8 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 def _use_active_home(monkeypatch, tmp_path):
     from api import models, profiles
@@ -36,6 +38,13 @@ def _open_wal_projects_db(projects_db: Path) -> sqlite3.Connection:
     writer.execute("INSERT INTO projects VALUES ('project-1', 'Project One')")
     writer.commit()
     return writer
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symlinks unsupported: {exc}")
 
 
 def test_single_profile_cache_key_tracks_projects_db_creation_and_change(
@@ -172,6 +181,43 @@ def test_projects_db_cache_fingerprint_ignores_empty_wal(monkeypatch, tmp_path):
     with_empty_wal = models._projects_db_stat_cache_key(projects_db)
 
     assert with_empty_wal == without_wal
+
+
+def test_projects_db_cache_fingerprint_does_not_follow_main_symlink(
+    monkeypatch, tmp_path
+):
+    models = _use_active_home(monkeypatch, tmp_path)
+    outside_db = tmp_path.parent / f"{tmp_path.name}-outside-projects.db"
+    outside_db.write_bytes(b"outside-project-data")
+    projects_db = tmp_path / "projects.db"
+    _symlink_or_skip(projects_db, outside_db)
+
+    key_before = models._projects_db_stat_cache_key(projects_db)
+    outside_db.write_bytes(b"changed-outside-project-data-and-metadata")
+    key_after = models._projects_db_stat_cache_key(projects_db)
+
+    assert key_after == key_before
+    assert key_before[0][0] == "non-regular"
+    assert str(outside_db) not in repr(key_before)
+
+
+def test_projects_db_cache_fingerprint_ignores_symlinked_wal(
+    monkeypatch, tmp_path
+):
+    models = _use_active_home(monkeypatch, tmp_path)
+    projects_db = tmp_path / "projects.db"
+    projects_db.write_bytes(b"project-data")
+    outside_wal = tmp_path.parent / f"{tmp_path.name}-outside-projects.db-wal"
+    outside_wal.write_bytes(b"outside-wal-data")
+    _symlink_or_skip(Path(f"{projects_db}-wal"), outside_wal)
+
+    key_before = models._projects_db_stat_cache_key(projects_db)
+    outside_wal.write_bytes(b"changed-outside-wal-data-and-metadata")
+    key_after = models._projects_db_stat_cache_key(projects_db)
+
+    assert key_after == key_before
+    assert key_before[1] is None
+    assert str(outside_wal) not in repr(key_before)
 
 
 def test_content_fingerprint_advances_on_commit():
