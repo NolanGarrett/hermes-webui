@@ -7517,6 +7517,28 @@ def _sqlite_file_stat_cache_key(db_path: Path):
     )
 
 
+def _projects_db_stat_cache_key(db_path: Path):
+    """Fingerprint durable main/WAL files without opening SQLite or reading SHM."""
+
+    def _durable_stat(path: Path):
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            stat.st_size,
+            stat.st_dev,
+            stat.st_ino,
+        )
+
+    wal_stat = _durable_stat(Path(f"{db_path}-wal"))
+    if wal_stat is not None and wal_stat[2] <= 0:
+        wal_stat = None
+    return (_durable_stat(db_path), wal_stat)
+
+
 def _cli_sessions_streaming_freeze_marker():
     """Return a stable cache-key marker while any turn is actively streaming.
 
@@ -7596,7 +7618,7 @@ def _resolve_cli_sessions_context(source_filter=None, include_claude_code: bool 
         str(db_path),
         str(source_filter or ''),
         db_state_key,
-        _sqlite_file_stat_cache_key(projects_db_path),
+        _projects_db_stat_cache_key(projects_db_path),
         bool(include_claude_code),
         _path_cache_key(projects_dir),
         _path_stat_cache_key(projects_dir),
