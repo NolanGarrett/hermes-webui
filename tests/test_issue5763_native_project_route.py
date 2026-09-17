@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 
 def _get_projects(
     monkeypatch,
@@ -212,3 +214,68 @@ def test_merge_helper_ignores_malformed_native_rows_without_mutating_inputs(monk
     assert [row["project_id"] for row in merged] == ["legacy", "native"]
     assert legacy == legacy_before
     assert native == native_before
+
+
+def test_merge_helper_skips_native_row_with_missing_profile_for_root(monkeypatch):
+    import api.profiles as profiles
+    import api.routes as routes
+
+    is_root = lambda name: name in {"default", "kinni"}
+    monkeypatch.setattr(profiles, "_is_root_profile", is_root)
+    monkeypatch.setattr(routes, "_is_root_profile", is_root)
+    native = {"project_id": "native", "name": "Missing profile"}
+
+    merged = routes._merge_active_profile_projects([], [native], "default")
+
+    assert merged == []
+
+
+def test_merge_helper_skips_native_row_with_unhashable_project_id(monkeypatch):
+    import api.routes as routes
+
+    monkeypatch.setattr(routes, "_is_root_profile", lambda _name: False)
+    monkeypatch.setattr(
+        routes,
+        "_profiles_match",
+        lambda row_profile, active_profile: row_profile == active_profile,
+    )
+    native = {"project_id": ["native"], "profile": "alpha"}
+
+    merged = routes._merge_active_profile_projects([], [native], "alpha")
+
+    assert merged == []
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [None, 7, "", "   "],
+    ids=["none", "non-string", "empty", "blank"],
+)
+def test_merge_helper_skips_native_rows_with_invalid_profiles(monkeypatch, profile):
+    import api.routes as routes
+
+    monkeypatch.setattr(routes, "_profiles_match", lambda *_args: True)
+    native = {"project_id": "native", "profile": profile}
+
+    merged = routes._merge_active_profile_projects([], [native], "alpha")
+
+    assert merged == []
+
+
+@pytest.mark.parametrize(
+    "project_id",
+    [None, 7, "", "   "],
+    ids=["none", "non-string", "empty", "blank"],
+)
+def test_merge_helper_skips_native_rows_with_invalid_project_ids(
+    monkeypatch, project_id
+):
+    import api.routes as routes
+
+    monkeypatch.setattr(routes, "_is_root_profile", lambda _name: False)
+    monkeypatch.setattr(routes, "_profiles_match", lambda *_args: True)
+    native = {"project_id": project_id, "profile": "alpha"}
+
+    merged = routes._merge_active_profile_projects([], [native], "alpha")
+
+    assert merged == []

@@ -513,18 +513,20 @@ def _merge_active_profile_projects(legacy_rows, native_rows, active_profile):
         if isinstance(row, dict) and row.get("project_id")
     }
     for row in native_rows:
-        if (
-            isinstance(row, dict)
-            and row.get("project_id")
-            and _profiles_match(row.get("profile"), active_profile)
-        ):
-            identity = (
-                _canonical_project_profile(row.get("profile")),
-                row["project_id"],
-            )
-            if identity not in identities:
-                merged.append(row)
-                identities.add(identity)
+        if not isinstance(row, dict):
+            continue
+        profile = row.get("profile")
+        project_id = row.get("project_id")
+        if not isinstance(profile, str) or not profile.strip():
+            continue
+        if not isinstance(project_id, str) or not project_id.strip():
+            continue
+        if not _profiles_match(profile, active_profile):
+            continue
+        identity = (_canonical_project_profile(profile), project_id)
+        if identity not in identities:
+            merged.append(row)
+            identities.add(identity)
     return merged
 
 
